@@ -55,7 +55,7 @@
         <article class="card storage"><div class="kicker">Fichiers</div><h2>Espace privé</h2><div class="big-number">🔐</div><div class="big-label">Photos et documents pourront être conservés dans votre dossier personnel.</div></article>
         <article class="card data"><div class="kicker">Mes données Clair</div><h2>Contenu personnel</h2><div id="dataCount" class="big-number">0</div><div id="dataLabel" class="big-label">donnée personnelle enregistrée</div><div id="lastData" class="big-label">Aucune donnée synchronisée pour le moment.</div><button id="testSyncButton" class="button soft test-button" type="button">Créer une donnée test</button></article>
         <article class="card account"><div class="kicker">Compte</div><h2>Contrôle total</h2><p>Vous gardez la maîtrise de votre session et de votre identité Clair.</p><button id="refreshButton" class="row-link" type="button"><strong>Actualiser l’espace</strong><span>↻</span></button><button id="logoutButton" class="row-link" type="button"><strong>Se déconnecter</strong><span>›</span></button></article>
-        <article class="card integration"><div class="kicker">Applications Clair</div><h2>Clair Repas est relié</h2><p>Première synchronisation réelle et sans risque : vos <strong>favoris Clair Repas</strong> peuvent maintenant suivre votre compte entre ordinateur et iPhone, sans modifier Clair Repas V7.5.</p><div id="crStatus" class="integration-status">Vérification de Clair Repas…</div><div class="integration-actions"><button id="syncCrButton" class="button primary" type="button">Synchroniser mes favoris</button><a class="button soft" href="https://ferdinand373.github.io/Clair-Repas/" target="_blank" rel="noopener">Ouvrir Clair Repas</a></div></article>
+        <article class="card integration"><div class="kicker">Applications Clair</div><h2>Clair Repas est synchronisé</h2><p>Vos <strong>données personnelles Clair Repas</strong> suivent désormais votre compte entre ordinateur et iPhone : favoris, notes, préférences, apprentissage et historiques. Les recettes et le moteur de Clair Repas V7.5 restent inchangés.</p><div id="crStatus" class="integration-status">Vérification de Clair Repas…</div><div class="integration-actions"><button id="syncCrButton" class="button primary" type="button">Synchroniser Clair Repas</button><a class="button soft" href="https://ferdinand373.github.io/Clair-Repas/" target="_blank" rel="noopener">Ouvrir Clair Repas</a></div></article>
       </div>
       <footer class="footer"><span>🌿 Espace Clair — Socle V8</span><span id="footerStatus">Connexion sécurisée à Supabase</span></footer>
     </section>
@@ -69,12 +69,24 @@
     'use strict';
     const SUPABASE_URL='https://ryyewskgfgysfubesdsj.supabase.co';
     const SUPABASE_PUBLISHABLE_KEY='sb_publishable_T9Dmg9VKTdMFdCuLVxD54w_7GeH3Q6S';
-    const APP_VERSION='Espace Clair V8.1 — Clair Repas';
+    const APP_VERSION='Espace Clair V8.2 — Clair Repas complet';
     const DEVICE_KEY_STORAGE='clair.device.key.v1';
     const $=id=>document.getElementById(id);
     const client=window.supabase.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});
     let currentUser=null,currentDevice=null;
-    const CR_FAVORITES_KEY='crFavMeals';
+    const CR_PERSONAL_KEYS=[
+      {key:'crFavMeals',label:'favoris'},
+      {key:'crRecipeNotesV31',label:'notes'},
+      {key:'crRecipeReactionsV3',label:'avis et réactions'},
+      {key:'crRecipeLearningV3',label:'préférences apprises'},
+      {key:'crRecentRecipesV25',label:'recettes récentes'},
+      {key:'crHistoryV13',label:'historique'},
+      {key:'crMealUsageV19',label:'usage des repas'},
+      {key:'crCourseUsageV37',label:'usage des courses'},
+      {key:'crStateV13',label:'état personnel'}
+    ];
+    const CR_KEY_SET=new Set(CR_PERSONAL_KEYS.map(x=>x.key));
+    let crSyncInFlight=false,crAutoTimer=null;
 
     function setMessage(el,text,type='info'){el.textContent=text||'';el.className='message'+(text?` visible ${type}`:'')}
     function setBusy(btn,busy,text){if(!btn)return;if(busy){btn.dataset.old=btn.textContent;btn.textContent=text;btn.disabled=true}else{btn.textContent=btn.dataset.old||btn.textContent;btn.disabled=false}}
@@ -90,19 +102,130 @@
     function displayName(user,profile){return profile?.display_name||user?.user_metadata?.display_name||user?.email?.split('@')[0]||'Utilisateur Clair'}
     function readLocalJson(key){const raw=localStorage.getItem(key);if(raw===null)return{exists:false,value:null};try{return{exists:true,value:JSON.parse(raw)}}catch{return{exists:true,value:raw}}}
     function writeLocalJson(key,value){localStorage.setItem(key,typeof value==='string'?value:JSON.stringify(value))}
-    function favIdentity(v){try{return JSON.stringify(v)}catch{return String(v)}}
-    function mergeFavorites(remoteValue,localValue){
-      if(Array.isArray(remoteValue)||Array.isArray(localValue)){const a=Array.isArray(remoteValue)?remoteValue:[],b=Array.isArray(localValue)?localValue:[],seen=new Set(),out=[];for(const item of [...a,...b]){const k=favIdentity(item);if(!seen.has(k)){seen.add(k);out.push(item)}}return out}
-      if(remoteValue&&typeof remoteValue==='object'&&localValue&&typeof localValue==='object')return{...remoteValue,...localValue};
-      return localValue??remoteValue??[];
+    function stableIdentity(v){try{return JSON.stringify(v)}catch{return String(v)}}
+    function isPlainObject(v){return !!v&&typeof v==='object'&&!Array.isArray(v)}
+    function mergeArrays(remoteValue,localValue){
+      const remote=Array.isArray(remoteValue)?remoteValue:[];
+      const local=Array.isArray(localValue)?localValue:[];
+      const seen=new Set(),out=[];
+      // Local first: preserves this device's most recent ordering, then adds missing remote entries.
+      for(const item of [...local,...remote]){const k=stableIdentity(item);if(!seen.has(k)){seen.add(k);out.push(item)}}
+      return out;
+    }
+    function mergePersonal(remoteValue,localValue){
+      if(Array.isArray(remoteValue)||Array.isArray(localValue))return mergeArrays(remoteValue,localValue);
+      if(isPlainObject(remoteValue)||isPlainObject(localValue)){
+        const r=isPlainObject(remoteValue)?remoteValue:{},l=isPlainObject(localValue)?localValue:{},out={...r};
+        for(const k of Object.keys(l))out[k]=(k in r)?mergePersonal(r[k],l[k]):l[k];
+        return out;
+      }
+      return localValue!==undefined&&localValue!==null?localValue:remoteValue;
     }
     function favoriteCount(v){if(Array.isArray(v))return v.length;if(v&&typeof v==='object')return Object.keys(v).length;return v?1:0}
-    async function updateClairRepasStatus(){if(!currentUser||!$('crStatus'))return;const local=readLocalJson(CR_FAVORITES_KEY);const r=await client.from('clair_data').select('payload,updated_at').eq('user_id',currentUser.id).eq('app_id','clair-repas').eq('data_key',CR_FAVORITES_KEY).is('deleted_at',null).maybeSingle();if(r.error){$('crStatus').textContent='Clair Repas : vérification momentanément indisponible.';return}const remoteValue=r.data?.payload?.value;const lc=local.exists?favoriteCount(local.value):0,rc=remoteValue!==undefined?favoriteCount(remoteValue):0;if(!local.exists&&!r.data)$('crStatus').textContent='Clair Repas détecté : aucun favori à synchroniser pour le moment.';else if(r.data)$('crStatus').textContent=`Favoris sur cet appareil : ${lc} · dans Mon espace Clair : ${rc}.`;else $('crStatus').textContent=`Favoris détectés sur cet appareil : ${lc} · prêts à être sauvegardés dans Mon espace Clair.`}
-    async function syncClairRepasFavorites(){if(!currentUser)return;const btn=$('syncCrButton');setBusy(btn,true,'Synchronisation…');try{const local=readLocalJson(CR_FAVORITES_KEY);const r=await client.from('clair_data').select('*').eq('user_id',currentUser.id).eq('app_id','clair-repas').eq('data_key',CR_FAVORITES_KEY).is('deleted_at',null).maybeSingle();if(r.error)throw r.error;const remoteValue=r.data?.payload?.value;if(!local.exists&&!r.data){$('crStatus').textContent='Aucun favori Clair Repas à synchroniser pour le moment.';return}const merged=mergeFavorites(remoteValue,local.exists?local.value:null);writeLocalJson(CR_FAVORITES_KEY,merged);const now=new Date().toISOString();const payload={value:merged,source_device:deviceLabel(),synced_at:now};const up=await client.from('clair_data').upsert({user_id:currentUser.id,app_id:'clair-repas',data_key:CR_FAVORITES_KEY,payload,schema_version:1,revision:(r.data?.revision||0)+1,last_device_id:currentDevice?.id||null,deleted_at:null,updated_at:now},{onConflict:'user_id,app_id,data_key'});if(up.error)throw up.error;$('crStatus').textContent=`✓ ${favoriteCount(merged)} favori${favoriteCount(merged)>1?'s':''} Clair Repas synchronisé${favoriteCount(merged)>1?'s':''} sur cet appareil et dans Mon espace Clair.`;await loadDashboard(currentUser)}catch(err){console.error(err);$('crStatus').textContent='Synchronisation impossible : '+friendly(err)}finally{setBusy(btn,false)}}
+    function meaningful(v){if(v===null||v===undefined)return false;if(Array.isArray(v))return v.length>0;if(isPlainObject(v))return Object.keys(v).length>0;if(typeof v==='string')return v.length>0;return true}
+
+    async function fetchCrRemoteRows(){
+      const keys=CR_PERSONAL_KEYS.map(x=>x.key);
+      const r=await client.from('clair_data').select('id,data_key,payload,revision,updated_at')
+        .eq('user_id',currentUser.id).eq('app_id','clair-repas')
+        .in('data_key',keys).is('deleted_at',null);
+      if(r.error)throw r.error;
+      return new Map((r.data||[]).map(row=>[row.data_key,row]));
+    }
+
+    async function updateClairRepasStatus(){
+      if(!currentUser||!$('crStatus'))return;
+      try{
+        const remote=await fetchCrRemoteRows();
+        let localTypes=0,remoteTypes=0;
+        for(const item of CR_PERSONAL_KEYS){
+          const l=readLocalJson(item.key);
+          if(l.exists&&meaningful(l.value))localTypes++;
+          const rv=remote.get(item.key)?.payload?.value;
+          if(rv!==undefined&&meaningful(rv))remoteTypes++;
+        }
+        const localFav=readLocalJson('crFavMeals');
+        const remoteFav=remote.get('crFavMeals')?.payload?.value;
+        const lf=localFav.exists?favoriteCount(localFav.value):0;
+        const rf=remoteFav!==undefined?favoriteCount(remoteFav):0;
+        if(!localTypes&&!remoteTypes){
+          $('crStatus').textContent='Clair Repas est relié. Aucune donnée personnelle à synchroniser pour le moment.';
+        }else{
+          $('crStatus').textContent=`Clair Repas : ${localTypes} type${localTypes>1?'s':''} de données sur cet appareil · ${remoteTypes} dans Mon espace Clair · favoris ${lf}/${rf}.`;
+        }
+      }catch(err){
+        console.error(err);
+        $('crStatus').textContent='Clair Repas : vérification momentanément indisponible.';
+      }
+    }
+
+    async function syncClairRepasPersonal(options={}){
+      if(!currentUser||crSyncInFlight||!navigator.onLine)return;
+      const silent=!!options.silent,btn=$('syncCrButton');
+      crSyncInFlight=true;
+      if(!silent)setBusy(btn,true,'Synchronisation…');
+      try{
+        const remote=await fetchCrRemoteRows();
+        let synced=0;
+        const now=new Date().toISOString();
+
+        for(const item of CR_PERSONAL_KEYS){
+          const local=readLocalJson(item.key);
+          const row=remote.get(item.key);
+          const remoteValue=row?.payload?.value;
+
+          if(!local.exists&&remoteValue===undefined)continue;
+
+          // Safe merge: empty local data never destroys remote data.
+          const merged=mergePersonal(remoteValue,local.exists?local.value:undefined);
+          if(merged===undefined)continue;
+
+          writeLocalJson(item.key,merged);
+
+          const payload={
+            value:merged,
+            source_device:deviceLabel(),
+            synced_at:now,
+            integration:'espace-clair-v8.2'
+          };
+          const up=await client.from('clair_data').upsert({
+            user_id:currentUser.id,
+            app_id:'clair-repas',
+            data_key:item.key,
+            payload,
+            schema_version:1,
+            revision:(row?.revision||0)+1,
+            last_device_id:currentDevice?.id||null,
+            deleted_at:null,
+            updated_at:now
+          },{onConflict:'user_id,app_id,data_key'});
+          if(up.error)throw up.error;
+          synced++;
+        }
+
+        await updateClairRepasStatus();
+        if(!silent){
+          $('crStatus').textContent=synced
+            ?`✓ Clair Repas synchronisé : ${synced} type${synced>1?'s':''} de données personnelles sont à jour sur cet appareil et dans Mon espace Clair.`
+            :'✓ Clair Repas est relié. Rien de nouveau à synchroniser pour le moment.';
+        }
+      }catch(err){
+        console.error(err);
+        if(!silent)$('crStatus').textContent='Synchronisation impossible : '+friendly(err);
+      }finally{
+        crSyncInFlight=false;
+        if(!silent)setBusy(btn,false);
+      }
+    }
+
+    function scheduleCrAutoSync(delay=500){
+      if(crAutoTimer)clearTimeout(crAutoTimer);
+      crAutoTimer=setTimeout(()=>syncClairRepasPersonal({silent:true}),delay);
+    }
 
     async function ensureProfile(user){let r=await client.from('clair_profiles').select('*').eq('user_id',user.id).maybeSingle();if(r.error)throw r.error;if(!r.data){const name=user.user_metadata?.display_name||user.email?.split('@')[0]||'Utilisateur Clair';r=await client.from('clair_profiles').upsert({user_id:user.id,display_name:name},{onConflict:'user_id'}).select('*').single();if(r.error)throw r.error}return r.data}
     async function registerDevice(user){const payload={user_id:user.id,device_key:deviceKey(),label:deviceLabel(),platform:platform(),app_version:APP_VERSION,last_seen_at:new Date().toISOString()};const r=await client.from('clair_devices').upsert(payload,{onConflict:'user_id,device_key'}).select('*').single();if(r.error)throw r.error;currentDevice=r.data;return r.data}
-    async function loadDashboard(user){currentUser=user;const profile=await ensureProfile(user);await registerDevice(user);const devicesR=await client.from('clair_devices').select('*').eq('user_id',user.id).order('last_seen_at',{ascending:false});if(devicesR.error)throw devicesR.error;const dataR=await client.from('clair_data').select('id,app_id,data_key,updated_at,payload',{count:'exact'}).eq('user_id',user.id).is('deleted_at',null).order('updated_at',{ascending:false}).limit(1);if(dataR.error)throw dataR.error;const name=displayName(user,profile);$('displayName').textContent=name;$('displayEmail').textContent=user.email||'—';$('avatar').textContent=(name.trim()[0]||'C').toUpperCase();$('welcomeTitle').textContent=`Bonjour ${name}`;$('memberSince').textContent=user.created_at?`Depuis ${pretty(user.created_at)}`:'Espace Clair';const count=dataR.count||0;$('dataCount').textContent=String(count);$('dataLabel').textContent=count>1?'données personnelles enregistrées':'donnée personnelle enregistrée';$('lastData').textContent=dataR.data?.[0]?`Dernière mise à jour : ${pretty(dataR.data[0].updated_at,true)}`:'Aucune donnée synchronisée pour le moment.';$('deviceList').innerHTML=(devicesR.data||[]).map(d=>`<div class="device"><div class="device-icon">${icon(d.platform||'')}</div><div class="device-copy"><div class="device-name">${escapeHtml(d.label||d.platform||'Appareil')}</div><div class="device-meta">${d.id===currentDevice?.id?'<span class="device-current">Cet appareil</span> · ':''}${escapeHtml(relative(d.last_seen_at))}</div></div></div>`).join('')||'<div class="device"><div class="device-icon">⌛</div><div class="device-copy"><div class="device-name">Aucun appareil détecté</div></div></div>';$('signedout').classList.add('hidden');$('dashboard').classList.add('visible');await updateClairRepasStatus()}
+    async function loadDashboard(user){currentUser=user;const profile=await ensureProfile(user);await registerDevice(user);const devicesR=await client.from('clair_devices').select('*').eq('user_id',user.id).order('last_seen_at',{ascending:false});if(devicesR.error)throw devicesR.error;const dataR=await client.from('clair_data').select('id,app_id,data_key,updated_at,payload',{count:'exact'}).eq('user_id',user.id).is('deleted_at',null).order('updated_at',{ascending:false}).limit(1);if(dataR.error)throw dataR.error;const name=displayName(user,profile);$('displayName').textContent=name;$('displayEmail').textContent=user.email||'—';$('avatar').textContent=(name.trim()[0]||'C').toUpperCase();$('welcomeTitle').textContent=`Bonjour ${name}`;$('memberSince').textContent=user.created_at?`Depuis ${pretty(user.created_at)}`:'Espace Clair';const count=dataR.count||0;$('dataCount').textContent=String(count);$('dataLabel').textContent=count>1?'données personnelles enregistrées':'donnée personnelle enregistrée';$('lastData').textContent=dataR.data?.[0]?`Dernière mise à jour : ${pretty(dataR.data[0].updated_at,true)}`:'Aucune donnée synchronisée pour le moment.';$('deviceList').innerHTML=(devicesR.data||[]).map(d=>`<div class="device"><div class="device-icon">${icon(d.platform||'')}</div><div class="device-copy"><div class="device-name">${escapeHtml(d.label||d.platform||'Appareil')}</div><div class="device-meta">${d.id===currentDevice?.id?'<span class="device-current">Cet appareil</span> · ':''}${escapeHtml(relative(d.last_seen_at))}</div></div></div>`).join('')||'<div class="device"><div class="device-icon">⌛</div><div class="device-copy"><div class="device-name">Aucun appareil détecté</div></div></div>';$('signedout').classList.add('hidden');$('dashboard').classList.add('visible');await updateClairRepasStatus();scheduleCrAutoSync(300)}
     function escapeHtml(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]))}
     function showSignedOut(){$('dashboard').classList.remove('visible');$('signedout').classList.remove('hidden');currentUser=null;currentDevice=null}
     async function refresh(){if(!currentUser)return;try{await loadDashboard(currentUser)}catch(e){console.error(e);$('syncBadge').textContent='⚠ Vérification nécessaire'}}
@@ -111,12 +234,15 @@
     $('loginForm').addEventListener('submit',async e=>{e.preventDefault();const btn=$('loginButton');setMessage($('authMessage'),'');setBusy(btn,true,'Connexion…');try{const {data,error}=await client.auth.signInWithPassword({email:$('loginEmail').value.trim(),password:$('loginPassword').value});if(error)throw error;if(!data.user)throw new Error('Connexion impossible.');await loadDashboard(data.user)}catch(err){setMessage($('authMessage'),friendly(err),'error')}finally{setBusy(btn,false)}});
     $('signupForm').addEventListener('submit',async e=>{e.preventDefault();const btn=$('signupButton');setMessage($('authMessage'),'');setBusy(btn,true,'Création…');try{const email=$('signupEmail').value.trim(),name=$('signupName').value.trim(),password=$('signupPassword').value;const {data,error}=await client.auth.signUp({email,password,options:{data:{display_name:name},emailRedirectTo:location.href}});if(error)throw error;if(data.session&&data.user){await loadDashboard(data.user)}else{setMessage($('authMessage'),'Votre espace est créé. Vérifiez votre e-mail pour confirmer votre adresse, puis revenez ici pour vous connecter.','success');switchAuth('login');$('loginEmail').value=email}}catch(err){setMessage($('authMessage'),friendly(err),'error')}finally{setBusy(btn,false)}});
     $('logoutButton').addEventListener('click',async()=>{await client.auth.signOut();showSignedOut()});$('refreshButton').addEventListener('click',refresh);
-    $('syncCrButton').addEventListener('click',syncClairRepasFavorites);
+    $('syncCrButton').addEventListener('click',()=>syncClairRepasPersonal({silent:false}));
     $('testSyncButton').addEventListener('click',async()=>{if(!currentUser)return;const btn=$('testSyncButton');setBusy(btn,true,'Enregistrement…');try{const existing=await client.from('clair_data').select('*').eq('user_id',currentUser.id).eq('app_id','espace-clair').eq('data_key','premier-test').maybeSingle();if(existing.error)throw existing.error;const revision=(existing.data?.revision||0)+1;const payload={message:'Bonjour depuis Espace Clair',device:deviceLabel(),saved_at:new Date().toISOString()};const r=await client.from('clair_data').upsert({user_id:currentUser.id,app_id:'espace-clair',data_key:'premier-test',payload,schema_version:1,revision,last_device_id:currentDevice?.id||null,deleted_at:null,updated_at:new Date().toISOString()},{onConflict:'user_id,app_id,data_key'});if(r.error)throw r.error;await refresh();$('lastData').textContent=`Test enregistré depuis ${deviceLabel()} à ${new Intl.DateTimeFormat('fr-FR',{timeStyle:'short'}).format(new Date())}`;}catch(err){alert(friendly(err))}finally{setBusy(btn,false)}});
     $('editProfile').addEventListener('click',()=>{$('profileNameInput').value=$('displayName').textContent||'';$('profileDialogBackdrop').classList.add('visible');setMessage($('profileMessage'),'')});$('cancelProfile').addEventListener('click',()=>$('profileDialogBackdrop').classList.remove('visible'));$('saveProfile').addEventListener('click',async()=>{if(!currentUser)return;const name=$('profileNameInput').value.trim();if(!name){setMessage($('profileMessage'),'Indiquez un nom.','error');return}try{const r=await client.from('clair_profiles').upsert({user_id:currentUser.id,display_name:name,updated_at:new Date().toISOString()},{onConflict:'user_id'});if(r.error)throw r.error;$('profileDialogBackdrop').classList.remove('visible');await refresh()}catch(err){setMessage($('profileMessage'),friendly(err),'error')}});
     function friendly(err){const m=String(err?.message||err||'Erreur inconnue');if(/Invalid login credentials/i.test(m))return'Adresse e-mail ou mot de passe incorrect.';if(/Email not confirmed/i.test(m))return'Confirmez d’abord votre adresse e-mail.';if(/User already registered/i.test(m))return'Un espace existe déjà avec cette adresse.';if(/Failed to fetch/i.test(m))return'Impossible de joindre le serveur. Vérifiez la connexion Internet.';return m}
 
-    window.addEventListener('online',setNetwork);window.addEventListener('offline',setNetwork);setNetwork();
+    window.addEventListener('storage',e=>{if(currentUser&&CR_KEY_SET.has(e.key))scheduleCrAutoSync(350)});
+    document.addEventListener('visibilitychange',()=>{if(!document.hidden&&currentUser)scheduleCrAutoSync(250)});
+    window.addEventListener('online',()=>{setNetwork();if(currentUser)scheduleCrAutoSync(250)});
+    window.addEventListener('offline',setNetwork);setNetwork();
     client.auth.onAuthStateChange(async(event,session)=>{if(session?.user){try{await loadDashboard(session.user)}catch(e){console.error(e);setMessage($('authMessage'),friendly(e),'error');showSignedOut()}}else if(event==='SIGNED_OUT'){showSignedOut()}});
     (async()=>{try{const {data}=await client.auth.getSession();if(data.session?.user)await loadDashboard(data.session.user);else showSignedOut()}catch(e){console.error(e);showSignedOut();setMessage($('authMessage'),friendly(e),'error')}finally{$('loading').classList.add('hidden')}})();
   })();
